@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'traefik'
+    static_configs:
+      - targets: ['traefik:8082']
+
+  - job_name: 'bbh-api'
+    static_configs:
+      - targets: ['bbh-api:3333']
+    metrics_path: '/api/metrics'
+
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']

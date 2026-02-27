@@ -1,0 +1,126 @@
+// ============================================================
+// BBH HMS – Prisma Schema
+// Database: PostgreSQL 16
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────
+
+enum Role {
+  OWNER         // Superuser – full system access
+  MANAGER       // Property management, reports, staff
+  FRONT_DESK    // Reservations, check-in/out
+  HOUSEKEEPING  // Room status updates
+  KITCHEN       // Kitchen order management
+  MAINTENANCE   // Maintenance requests
+}
+
+enum ModuleName {
+  RESTAURANT
+  SPA
+  KITCHEN
+  HOUSEKEEPING
+  MAINTENANCE
+  EVENTS
+  POS
+}
+
+// ─────────────────────────────────────────────────────────────
+// GLOBAL CONFIG  (Singleton – always one row)
+// ─────────────────────────────────────────────────────────────
+
+model GlobalConfig {
+  id               String   @id @default(uuid()) @db.Uuid
+  hotel_name       String   @default("BBH Hotel")
+  logo_url         String?  // MinIO path e.g. bbh-public/logos/hotel-logo.png
+  primary_color    String   @default("#1a56db")
+  accent_color     String   @default("#7e3af2")
+  currency         String   @default("USD")
+  timezone         String   @default("UTC")
+  maintenance_mode Boolean  @default(false)
+  tagline          String?
+  address          String?
+  phone            String?
+  email            String?
+  website_footer   String?
+  created_at       DateTime @default(now())
+  updated_at       DateTime @updatedAt
+
+  @@map("global_config")
+}
+
+// ─────────────────────────────────────────────────────────────
+// USER
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id            String     @id @default(uuid()) @db.Uuid
+  email         String     @unique
+  password_hash String     // Argon2id hash
+  pin_code      String?    // 4-6 digit PIN (hashed) for quick POS access
+  role          Role       @default(FRONT_DESK)
+  first_name    String
+  last_name     String
+  avatar_url    String?    // MinIO path
+  is_active     Boolean    @default(true)
+  last_login_at DateTime?
+  created_at    DateTime   @default(now())
+  updated_at    DateTime   @updatedAt
+
+  // Relations
+  audit_logs    AuditLog[] @relation("PerformedBy")
+
+  @@index([email])
+  @@index([role])
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────
+// AUDIT LOG  (Immutable – append-only)
+// ─────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id              String   @id @default(uuid()) @db.Uuid
+  action          String   // e.g. "USER_LOGIN", "CONFIG_UPDATE", "BOOKING_CANCEL"
+  resource        String   // e.g. "GlobalConfig", "User", "Booking"
+  resource_id     String?  // UUID of affected resource
+  old_value       Json?    // Snapshot before change
+  new_value       Json?    // Snapshot after change
+  ip_address      String?
+  user_agent      String?
+  timestamp       DateTime @default(now())
+
+  // FK – nullable so system actions (seed, migrations) can log without a user
+  performed_by_id String?  @db.Uuid
+  performed_by    User?    @relation("PerformedBy", fields: [performed_by_id], references: [id], onDelete: SetNull)
+
+  @@index([action])
+  @@index([resource])
+  @@index([performed_by_id])
+  @@index([timestamp])
+  @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────
+// MODULE STATE  (Feature Flags)
+// ─────────────────────────────────────────────────────────────
+
+model ModuleState {
+  id          String     @id @default(uuid()) @db.Uuid
+  module_name ModuleName @unique
+  is_enabled  Boolean    @default(false)
+  config      Json?      // Module-specific config blob
+  updated_at  DateTime   @updatedAt
+
+  @@map("module_states")
+}

@@ -1,0 +1,278 @@
+version: "3.9"
+
+###############################################################################
+# BBH HMS – Production Docker Composition
+# Networks: public-net (Traefik-facing) | service-net (internal only)
+###############################################################################
+
+networks:
+  public-net:
+    driver: bridge
+  service-net:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  prometheus-data:
+  grafana-data:
+  website-source-code:   # THE "SAFE UPDATE" SHARED VOLUME
+
+services:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # TRAEFIK v3 – Reverse Proxy / TLS Termination
+  # ─────────────────────────────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.0
+    container_name: bbh-traefik
+    restart: unless-stopped
+    command:
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=public-net"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.entryPoint=metrics"
+      - "--entrypoints.metrics.address=:8082"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "./infra/letsencrypt:/letsencrypt"
+    networks:
+      - public-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik-dashboard.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
+      - "traefik.http.routers.traefik-dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.traefik-dashboard.service=api@internal"
+      - "traefik.http.routers.traefik-dashboard.middlewares=auth-admin"
+      - "traefik.http.middlewares.auth-admin.basicauth.users=${TRAEFIK_BASIC_AUTH}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # POSTGRESQL 16
+  # ─────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: bbh-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - service-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # REDIS 7 – Sessions & Cache
+  # ─────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: bbh-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - service-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # MINIO – Self-hosted S3 Object Storage
+  # ─────────────────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: bbh-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    networks:
+      - service-net
+      - public-net
+    labels:
+      - "traefik.enable=true"
+      # MinIO API
+      - "traefik.http.routers.minio-api.rule=Host(`storage.${DOMAIN}`)"
+      - "traefik.http.routers.minio-api.entrypoints=websecure"
+      - "traefik.http.routers.minio-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.minio-api.service=minio-api-svc"
+      - "traefik.http.services.minio-api-svc.loadbalancer.server.port=9000"
+      # MinIO Console
+      - "traefik.http.routers.minio-console.rule=Host(`minio.${DOMAIN}`)"
+      - "traefik.http.routers.minio-console.entrypoints=websecure"
+      - "traefik.http.routers.minio-console.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.minio-console.service=minio-console-svc"
+      - "traefik.http.services.minio-console-svc.loadbalancer.server.port=9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # PROMETHEUS – Metrics Collection
+  # ─────────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: bbh-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - service-net
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # GRAFANA – Metrics Visualization
+  # ─────────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: bbh-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_SERVER_ROOT_URL: "https://metrics.${DOMAIN}"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - service-net
+      - public-net
+    depends_on:
+      - prometheus
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`metrics.${DOMAIN}`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.services.grafana-svc.loadbalancer.server.port=3000"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # BBH-API – NestJS Backend (non-root user)
+  # ─────────────────────────────────────────────────────────────────────────
+  bbh-api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: bbh-api
+    restart: unless-stopped
+    user: "1001:1001"           # NON-ROOT – Security enforcement
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: "9000"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET}
+      CORS_ORIGIN: "https://${DOMAIN}"
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - website-source-code:/mnt/website   # SAFE UPDATE: API writes here
+    networks:
+      - service-net
+      - public-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.bbh-api.rule=Host(`api.${DOMAIN}`)"
+      - "traefik.http.routers.bbh-api.entrypoints=websecure"
+      - "traefik.http.routers.bbh-api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.bbh-api-svc.loadbalancer.server.port=3333"
+      # Security headers middleware
+      - "traefik.http.middlewares.security-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.security-headers.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.security-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.security-headers.headers.frameDeny=true"
+      - "traefik.http.routers.bbh-api.middlewares=security-headers"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # BBH-ADMIN – Next.js Staff Panel
+  # ─────────────────────────────────────────────────────────────────────────
+  bbh-admin:
+    build:
+      context: .
+      dockerfile: apps/admin/Dockerfile
+    container_name: bbh-admin
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: "https://api.${DOMAIN}"
+    networks:
+      - service-net
+      - public-net
+    depends_on:
+      - bbh-api
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.bbh-admin.rule=Host(`admin.${DOMAIN}`)"
+      - "traefik.http.routers.bbh-admin.entrypoints=websecure"
+      - "traefik.http.routers.bbh-admin.tls.certresolver=letsencrypt"
+      - "traefik.http.services.bbh-admin-svc.loadbalancer.server.port=3000"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # BBH-WEBSITE – Public Guest Site (PM2 Watch Mode)
+  # ─────────────────────────────────────────────────────────────────────────
+  bbh-website:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: bbh-website
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: "https://api.${DOMAIN}"
+    volumes:
+      - website-source-code:/app   # SAFE UPDATE: PM2 watches this
+    networks:
+      - service-net
+      - public-net
+    depends_on:
+      - bbh-api
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.bbh-website.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.bbh-website.entrypoints=websecure"
+      - "traefik.http.routers.bbh-website.tls.certresolver=letsencrypt"
+      - "traefik.http.services.bbh-website-svc.loadbalancer.server.port=3000"
